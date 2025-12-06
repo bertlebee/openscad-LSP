@@ -7,9 +7,10 @@ use std::{
 use lsp_server::{ErrorCode, RequestId, Response, ResponseError};
 use lsp_types::{
     CompletionItem, CompletionItemKind, CompletionList, CompletionParams, CompletionResponse,
-    DocumentFormattingParams, DocumentSymbolParams, DocumentSymbolResponse, Documentation,
-    GotoDefinitionParams, GotoDefinitionResponse, Hover, HoverContents, HoverParams,
-    InsertTextFormat, InsertTextMode, Location, MarkupContent, Range, RenameParams,
+    DocumentFormattingParams, DocumentHighlight, DocumentHighlightKind, DocumentHighlightParams,
+    DocumentSymbolParams, DocumentSymbolResponse, Documentation, GotoDefinitionParams,
+    GotoDefinitionResponse, Hover, HoverContents, HoverParams, InsertTextFormat, InsertTextMode,
+    Location, MarkupContent, Range, ReferenceParams, RenameParams,
     SymbolInformation, TextDocumentPositionParams, TextEdit, WorkspaceEdit,
 };
 
@@ -27,6 +28,68 @@ fn get_node_at_point<'a>(parsed_code: &'a Ref<'_, ParsedCode>, point: Point) -> 
     let mut cursor = parsed_code.tree.root_node().walk();
     while cursor.goto_first_child_for_point(point).is_some() {}
     cursor.node()
+}
+
+/// A reference to an identifier in the source code.
+#[derive(Debug)]
+struct IdentifierReference {
+    /// The range of the identifier in the source code.
+    range: Range,
+    /// Whether this is a write (assignment) or read reference.
+    is_write: bool,
+}
+
+/// Collects all references to an identifier within a scope.
+///
+/// This function traverses the given scope and finds all occurrences of the
+/// specified identifier, handling variable shadowing in nested scopes.
+///
+/// # Arguments
+/// * `code` - The source code string
+/// * `parent_scope` - The scope node to search within
+/// * `ident_name` - The identifier name to search for
+/// * `definition_node` - The node where the identifier is defined (to distinguish from shadowing)
+///
+/// # Returns
+/// A vector of `IdentifierReference` containing the range and write status of each reference.
+fn collect_references_in_scope<'a>(
+    code: &str,
+    parent_scope: Node<'a>,
+    ident_name: &str,
+    definition_node: Node<'a>,
+) -> Vec<IdentifierReference> {
+    let mut refs = vec![];
+    let mut node_iter = traverse(parent_scope.walk(), Order::Post);
+
+    while let Some(node) = node_iter.next() {
+        // Skip non-matching identifiers
+        if node.kind() != "identifier" || node_text(code, &node) != ident_name {
+            continue;
+        }
+
+        let is_assignment = node
+            .parent()
+            .is_some_and(|parent| parent.kind() == "assignment");
+
+        // If this is an assignment in a subscope (not our definition), it shadows our variable
+        let is_assignment_in_subscope = is_assignment && node != definition_node;
+        if is_assignment_in_subscope {
+            // Skip this subscope entirely - the variable is shadowed here
+            let scope = find_node_scope(node).unwrap();
+            while node_iter.next().is_some_and(|next| scope != next) {}
+            continue;
+        }
+
+        refs.push(IdentifierReference {
+            range: Range {
+                start: to_position(node.start_position()),
+                end: to_position(node.end_position()),
+            },
+            is_write: is_assignment,
+        });
+    }
+
+    refs
 }
 
 // Request handlers.
@@ -194,35 +257,21 @@ impl Server {
             (ident_initial_name, parent_scope, definition_node)
         };
 
-        let mut node_iter = traverse(parent_scope.walk(), Order::Post);
-        let mut changes = vec![];
-        while let Some(node) = node_iter.next() {
-            let is_identifier_instance =
-                node.kind() != "identifier" || node_text(&bfile.code, &node) != ident_initial_name;
-            if is_identifier_instance {
-                continue;
-            }
+        // Use the shared helper to collect all references
+        let refs = collect_references_in_scope(
+            &bfile.code,
+            parent_scope,
+            ident_initial_name,
+            ident_initial_node,
+        );
 
-            let is_assignment = node
-                .parent()
-                .is_some_and(|node| node.kind() == "assignment");
-            let is_assignment_in_subscope = is_assignment && node != ident_initial_node;
-            if is_assignment_in_subscope {
-                // Unwrap is ok because an identifier node would always have a parent scope.
-                let scope = find_node_scope(node).unwrap();
-                // Consume iterator until it reaches the parent scope
-                while node_iter.next().is_some_and(|next| scope != next) {}
-                continue;
-            }
-
-            changes.push(TextEdit {
-                range: Range {
-                    start: to_position(node.start_position()),
-                    end: to_position(node.end_position()),
-                },
+        let changes: Vec<TextEdit> = refs
+            .into_iter()
+            .map(|r| TextEdit {
+                range: r.range,
                 new_text: ident_new_name.to_string(),
-            });
-        }
+            })
+            .collect();
 
         let result = WorkspaceEdit {
             changes: Some({
@@ -239,6 +288,268 @@ impl Server {
             error: None,
         });
     }
+
+    pub(crate) fn handle_references(&mut self, id: RequestId, params: ReferenceParams) {
+        let uri = params.text_document_position.text_document.uri;
+        let pos = params.text_document_position.position;
+
+        let file = match self.get_code(&uri) {
+            Some(code) => code,
+            _ => {
+                self.respond(Response {
+                    id,
+                    result: Some(serde_json::to_value::<Vec<Location>>(vec![]).unwrap()),
+                    error: None,
+                });
+                return;
+            }
+        };
+        file.borrow_mut().gen_top_level_items_if_needed();
+        let bfile = file.borrow();
+
+        // Get the identifier at the cursor position
+        let node = get_node_at_point(&bfile, to_point(pos));
+        if node.kind() != "identifier" {
+            self.respond(Response {
+                id,
+                result: Some(serde_json::to_value::<Vec<Location>>(vec![]).unwrap()),
+                error: None,
+            });
+            return;
+        }
+
+        let ident_name = node_text(&bfile.code, &node);
+
+        // Find the definition of this identifier
+        let identifier_definition = self.find_identities(
+            &file.borrow(),
+            &|name| name == ident_name,
+            &node,
+            false,
+            0,
+        );
+
+        let definition = match identifier_definition.first() {
+            Some(def) => def,
+            None => {
+                self.respond(Response {
+                    id,
+                    result: Some(serde_json::to_value::<Vec<Location>>(vec![]).unwrap()),
+                    error: None,
+                });
+                return;
+            }
+        };
+
+        let def_url = match &definition.borrow().url {
+            Some(url) => url.clone(),
+            None => {
+                // Builtin - no references to find
+                self.respond(Response {
+                    id,
+                    result: Some(serde_json::to_value::<Vec<Location>>(vec![]).unwrap()),
+                    error: None,
+                });
+                return;
+            }
+        };
+
+        let mut locations: Vec<Location> = vec![];
+
+        // Optionally include the definition itself
+        if params.context.include_declaration {
+            locations.push(Location {
+                uri: def_url.clone(),
+                range: definition.borrow().range,
+            });
+        }
+
+        // Get the definition file and find references in it
+        let def_file = match self.get_code(&def_url) {
+            Some(code) => code,
+            None => {
+                self.respond(Response {
+                    id,
+                    result: Some(serde_json::to_value(locations).unwrap()),
+                    error: None,
+                });
+                return;
+            }
+        };
+        def_file.borrow_mut().gen_top_level_items_if_needed();
+
+        // Find the definition node in the definition file
+        let def_bfile = def_file.borrow();
+        let definition_node = get_node_at_point(&def_bfile, to_point(definition.borrow().range.start));
+        let parent_scope = match find_node_scope(definition_node) {
+            Some(scope) => scope,
+            None => {
+                self.respond(Response {
+                    id,
+                    result: Some(serde_json::to_value(locations).unwrap()),
+                    error: None,
+                });
+                return;
+            }
+        };
+
+        // Collect references in the definition's file
+        let refs = collect_references_in_scope(&def_bfile.code, parent_scope, ident_name, definition_node);
+        for r in refs {
+            // Skip the definition itself if we already added it
+            if params.context.include_declaration && r.range == definition.borrow().range {
+                continue;
+            }
+            locations.push(Location {
+                uri: def_url.clone(),
+                range: r.range,
+            });
+        }
+
+        // Drop the borrow before accessing dep_graph
+        drop(def_bfile);
+        drop(def_file);
+
+        // Now search in files that include the definition's file
+        let dependents = self.dep_graph.get_all_dependents(&def_url);
+        for dep_url in dependents {
+            let dep_file = match self.get_code(&dep_url) {
+                Some(code) => code,
+                None => continue,
+            };
+            dep_file.borrow_mut().gen_top_level_items_if_needed();
+            let dep_bfile = dep_file.borrow();
+
+            // Search from the root of the dependent file
+            let root = dep_bfile.tree.root_node();
+
+            // For top-level symbols, we search the entire file
+            // We need a dummy definition node - use the root itself since we're searching for usages
+            let refs = collect_references_in_scope(&dep_bfile.code, root, ident_name, root);
+            for r in refs {
+                locations.push(Location {
+                    uri: dep_url.clone(),
+                    range: r.range,
+                });
+            }
+        }
+
+        self.respond(Response {
+            id,
+            result: Some(serde_json::to_value(locations).unwrap()),
+            error: None,
+        });
+    }
+
+    pub(crate) fn handle_document_highlight(
+        &mut self,
+        id: RequestId,
+        params: DocumentHighlightParams,
+    ) {
+        let uri = params.text_document_position_params.text_document.uri;
+        let pos = params.text_document_position_params.position;
+
+        let file = match self.get_code(&uri) {
+            Some(code) => code,
+            _ => {
+                self.respond(Response {
+                    id,
+                    result: Some(serde_json::to_value::<Vec<DocumentHighlight>>(vec![]).unwrap()),
+                    error: None,
+                });
+                return;
+            }
+        };
+        file.borrow_mut().gen_top_level_items_if_needed();
+        let bfile = file.borrow();
+
+        // Get the identifier at the cursor position
+        let node = get_node_at_point(&bfile, to_point(pos));
+        if node.kind() != "identifier" {
+            self.respond(Response {
+                id,
+                result: Some(serde_json::to_value::<Vec<DocumentHighlight>>(vec![]).unwrap()),
+                error: None,
+            });
+            return;
+        }
+
+        let ident_name = node_text(&bfile.code, &node);
+
+        // Find the definition of this identifier
+        let identifier_definition = self.find_identities(
+            &file.borrow(),
+            &|name| name == ident_name,
+            &node,
+            false,
+            0,
+        );
+
+        let definition = match identifier_definition.first() {
+            Some(def) => def,
+            None => {
+                self.respond(Response {
+                    id,
+                    result: Some(serde_json::to_value::<Vec<DocumentHighlight>>(vec![]).unwrap()),
+                    error: None,
+                });
+                return;
+            }
+        };
+
+        // For document highlight, we only care about the current file
+        let def_url = definition.borrow().url.clone();
+
+        // If the definition is not in the current file, we can only highlight usages in this file
+        let search_scope = if def_url.as_ref() == Some(&uri) {
+            // Definition is in this file - find its scope
+            let definition_node = get_node_at_point(&bfile, to_point(definition.borrow().range.start));
+            find_node_scope(definition_node)
+        } else {
+            // Definition is in another file - search from root
+            Some(bfile.tree.root_node())
+        };
+
+        let parent_scope = match search_scope {
+            Some(scope) => scope,
+            None => {
+                self.respond(Response {
+                    id,
+                    result: Some(serde_json::to_value::<Vec<DocumentHighlight>>(vec![]).unwrap()),
+                    error: None,
+                });
+                return;
+            }
+        };
+
+        // Use a dummy definition node if definition is in another file
+        let definition_node = if def_url.as_ref() == Some(&uri) {
+            get_node_at_point(&bfile, to_point(definition.borrow().range.start))
+        } else {
+            bfile.tree.root_node() // Dummy - no local definition to avoid
+        };
+
+        let refs = collect_references_in_scope(&bfile.code, parent_scope, ident_name, definition_node);
+
+        let highlights: Vec<DocumentHighlight> = refs
+            .into_iter()
+            .map(|r| DocumentHighlight {
+                range: r.range,
+                kind: Some(if r.is_write {
+                    DocumentHighlightKind::WRITE
+                } else {
+                    DocumentHighlightKind::READ
+                }),
+            })
+            .collect();
+
+        self.respond(Response {
+            id,
+            result: Some(serde_json::to_value(highlights).unwrap()),
+            error: None,
+        });
+    }
+
     pub(crate) fn handle_hover(&mut self, id: RequestId, params: HoverParams) {
         let uri = &params.text_document_position_params.text_document.uri;
         let pos = params.text_document_position_params.position;

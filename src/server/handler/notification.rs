@@ -16,7 +16,14 @@ impl Server {
         if self.codes.contains_key(&doc.uri) {
             return;
         }
-        self.insert_code(doc.uri, doc.text);
+        let url = doc.uri.clone();
+        let code = self.insert_code(doc.uri, doc.text);
+
+        // Generate top-level items to get includes, then update dependency graph
+        code.borrow_mut().gen_top_level_items_if_needed();
+        if let Some(includes) = &code.borrow().includes {
+            self.dep_graph.update_file(&url, includes);
+        }
     }
 
     pub(crate) fn handle_did_change_text_document(&mut self, params: DidChangeTextDocumentParams) {
@@ -25,8 +32,9 @@ impl Server {
             content_changes,
         } = params;
 
+        // Clone the Rc to avoid holding onto the mutable borrow of self.codes
         let pc = match self.codes.get_refresh(&text_document.uri) {
-            Some(x) => x,
+            Some(x) => x.clone(),
             None => {
                 err_to_console!("unknown document {}", text_document.uri);
                 return;
@@ -76,11 +84,17 @@ impl Server {
         self.notify(lsp_server::Notification::new(
             "textDocument/publishDiagnostics".into(),
             PublishDiagnosticsParams {
-                uri: text_document.uri,
+                uri: text_document.uri.clone(),
                 diagnostics: diags,
                 version: Some(text_document.version),
             },
         ));
+
+        // Regenerate includes and update dependency graph
+        pc.borrow_mut().gen_top_level_items_if_needed();
+        if let Some(includes) = &pc.borrow().includes {
+            self.dep_graph.update_file(&text_document.uri, includes);
+        }
     }
 
     pub(crate) fn handle_did_change_config(&mut self, params: DidChangeConfigurationParams) {
@@ -139,5 +153,7 @@ impl Server {
 
     pub(crate) fn handle_did_save_text_document(&mut self, _params: DidSaveTextDocumentParams) {}
 
-    pub(crate) fn handle_did_close_text_document(&mut self, _params: DidCloseTextDocumentParams) {}
+    pub(crate) fn handle_did_close_text_document(&mut self, params: DidCloseTextDocumentParams) {
+        self.dep_graph.remove_file(&params.text_document.uri);
+    }
 }
